@@ -6,9 +6,8 @@ class RoadPanelDetector:
     """
     Detects road information panels using:
     1. MSER (Maximally Stable Extremal Regions) for region detection
-    2. HSV + LAB color analysis for blue color verification
-    3. Morphological operations for robustness
-    4. NMS for duplicate elimination
+    2. HSV + LAB + Houghes for similarity with panel score
+    3. NMS for duplicate elimination
     """
     
     def __init__(self):
@@ -20,19 +19,13 @@ class RoadPanelDetector:
         # delta: threshold increase between MSER calculations
         self.mser = cv2.MSER_create(
             min_area=300,
-            max_area=20000,
+            max_area=80000,
             delta=10
         )
 
         # Standard size for blue score computation
         self.std_w = 40
         self.std_h = 80
-
-        # Ideal blue mask (all ones - full blue color expected)
-        self.ideal_mask = np.ones(
-            (self.std_h, self.std_w),
-            dtype=np.uint8
-        )
 
     def detect(self, image):
         """
@@ -47,14 +40,14 @@ class RoadPanelDetector:
         detections = []
 
         # Step 1: Preprocess image to improve quality
-        image = self._preprocess_image(image)
+        image = self.preprocess_image(image)
 
         # Step 2: Convert to grayscale for MSER
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         # Step 3: Enhance contrast with CLAHE
         clahe = cv2.createCLAHE(
-            clipLimit=2.0,
+            clipLimit=1.5,
             tileGridSize=(8, 8)
         )
         gray = clahe.apply(gray)
@@ -69,20 +62,20 @@ class RoadPanelDetector:
             x, y, w, h = cv2.boundingRect(region)
 
             # Filter by minimum size
-            if w < 60 or h < 30:
+            if w < 30 or h < 20:
                 continue
 
             # Filter by aspect ratio (panels are wider than tall)
             aspect_ratio = w / float(h)
 
             # Adjusted range based on real panel proportions
-            if aspect_ratio < 1.2 or aspect_ratio > 4.0:
+            if aspect_ratio < 0.8 or aspect_ratio > 6.5:
                 continue
 
             # Expand bounding box to include white border
             # MSER detects the blue interior, we need the whole panel
-            pad_x = int(w * 0.05)
-            pad_y = int(h * 0.1)
+            pad_x = int(w * 0.025)
+            pad_y = int(h * 0.05)
 
             x1 = max(0, x - pad_x)
             y1 = max(0, y - pad_y)
@@ -91,7 +84,7 @@ class RoadPanelDetector:
 
             candidate_boxes.append((x1, y1, x2, y2))
 
-        # Step 6: Score each candidate box based on blue color
+        # Step 6: Score each candidate box
         for box in candidate_boxes:
             x1, y1, x2, y2 = box
 
@@ -101,10 +94,10 @@ class RoadPanelDetector:
             if crop.size == 0:
                 continue
 
-            # Compute blue color score (0 to 1, where 1 is perfect blue)
-            score = self.compute_blue_score(crop)
+            # Compute score
+            score = self.compute_score(crop)
 
-            if score > 0.5:
+            if score > 0.3:
                 detections.append([x1, y1, x2, y2, score])
 
         # Step 7: Remove duplicate detections (NMS)
@@ -112,75 +105,138 @@ class RoadPanelDetector:
 
         return detections
 
-    def compute_blue_score(self, crop):
+    def compute_score(self, crop):
         """
-        Computes a score representing how much the crop looks like a blue panel.
+        Computes a score representing how much the crop looks like a road panel.
         
         Strategy:
-        1. Use HSV to detect blue hue and saturation
-        2. Use LAB to verify blue color (low b channel)
-        3. Combine both masks
-        4. Compute intensity and clarity
-        5. Return weighted score
+        1. Use HSV to detect blue
+        2. Use LAB to verify white color
+        3. Use Hough lines to detect panel line borders
+        4. Compute final score
         
         Args:
             crop: Image region to analyze
             
         Returns:
-            float: Score between 0 (not blue) and 1 (perfectly blue)
+            float: Score between 0 (not similar to a panel) and 1 (panel)
         """
         
         # Resize to standard size for consistent scoring
         resized = cv2.resize(crop, (self.std_w, self.std_h))
-        
-        # Convert to HSV for hue-based color detection
+
+        # 1. BLUE DETECTION
         hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
-        
-        # Convert to LAB for blue channel analysis
-        lab = cv2.cvtColor(resized, cv2.COLOR_BGR2Lab)
-        
-        # Get brightness (Value in HSV)
-        avg_v = np.mean(hsv[:, :, 2])
-        
-        # ===== HSV BLUE DETECTION =====
-        # Adapt saturation threshold based on brightness
-        sat_min = 50 if avg_v > 50 else 30
-        
-        # Blue limits in HSV:
-        lower_blue = np.array([95, sat_min, 25])
-        upper_blue = np.array([145, 255, 255])
-        
-        mask_hsv = cv2.inRange(hsv, lower_blue, upper_blue)
-        
-        # Morphological closing to fill small holes
-        mask_hsv = cv2.morphologyEx(mask_hsv, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-        
-        # ===== LAB BLUE DETECTION =====
-        b_channel = lab[:, :, 2]
-        mask_lab = cv2.inRange(b_channel, 0, 118)
-        
-        # ===== COMBINE MASKS =====
-        # Both HSV and LAB must agree it's blue
-        mask = cv2.bitwise_and(mask_hsv, mask_lab)
-        
-        # ===== COMPUTE SCORE =====
-        # Intensity: what percentage of pixels are blue
-        intensity = np.sum(mask) / (self.std_w * self.std_h * 255.0)
-        
-        # Clarity: is the image blurry? (Laplacian variance)
-        clarity = cv2.Laplacian(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() / 1000.0
-        
-        # Weight: intensity is more important than clarity
-        # In bad weather (low clarity), we don't penalize much
-        clarity_weight = 0.1 if clarity < 0.1 else 0.2
-        
-        # Final score: weighted combination
-        score = (1.0 - clarity_weight) * intensity + clarity_weight * min(clarity, 1.0)
+
+        # Blue range in HSV (tight to avoid false positives)
+        lower_blue = np.array([100, 130, 60])
+        upper_blue = np.array([125, 255, 255])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+        # Clean small holes and smooth regions
+        kernel = np.ones((5, 5), np.uint8)
+        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
+        blue_mask = cv2.GaussianBlur(blue_mask, (7, 7), 0)
+
+        # Normalize to [0,1]
+        blue = blue_mask.astype(np.float32) / 255.0
+
+        # Ideal blue mask
+        ideal = np.zeros((self.std_h, self.std_w), dtype=np.float32)
+        ideal[3:-3, 3:-3] = 1.0
+        ideal[12:-12, 12:-12] = 0.7
+        ideal[20:-20, 20:-20] = 0.4
+
+        blue_score = np.sum(blue * ideal) / (np.sum(ideal) + 1e-6)
+
+        # 2. WHITE DETECTION (LAB)
+        lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
+
+        L = lab[:, :, 0]
+        A = lab[:, :, 1]
+        B = lab[:, :, 2]
+
+        white = (
+            (L > 170) &
+            (np.abs(A - 128) < 18) &
+            (np.abs(B - 128) < 18)
+        ).astype(np.uint8)
+
+        white_ratio = np.mean(white)
+
+        # Reject if too much white (likely text/signs)
+        if white_ratio > 0.3:
+            return 0.0
+
+        # Expect white border region
+        border = np.zeros_like(white)
+
+        t = 3
+        border[:t, :] = 1
+        border[-t:, :] = 1
+        border[:, :t] = 1
+        border[:, -t:] = 1
+
+        white_border_score = np.sum(white * border) / (np.sum(border) + 1e-6)
+
+        # 3. HOUGH LINES SCORE
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 60, 150)
+
+        # Detect line segments
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=25,
+            minLineLength=10,
+            maxLineGap=5
+        )
+
+        h_lines = 0
+        v_lines = 0
+        total_len = 0
+
+        if lines is not None:
+            for l in lines:
+                x1, y1, x2, y2 = l[0]
+
+                # Line length contribution
+                length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                total_len += length
+
+                # Separate horizontal vs vertical structure
+                if abs(x2 - x1) > abs(y2 - y1):
+                    h_lines += length
+                else:
+                    v_lines += length
+
+        # Normalize total amount of structure
+        line_score = min(1.0, total_len / 80.0)
+
+        # Penalize unstructured / noisy line distribution
+        if (h_lines + v_lines) > 0:
+            balance = abs(h_lines - v_lines) / (h_lines + v_lines)
+        else:
+            balance = 1.0
+
+        # Prefer balanced rectangular structure
+        structure_score = line_score * (1.0 - balance)
+
+        # 4. FINAL SCORE
+        score = (
+            0.6 * blue_score +
+            0.2 * white_border_score +
+            0.2 * structure_score
+        )
+
         return float(score)
 
     def non_max_suppression(self, detections):
         """
-        Remove duplicate detections by keeping only the best one
+        Perform Non-Maximum Suppression (NMS) to remove redundant detections.
+
+        Removes duplicate detections by keeping only the best one (biggest with best score) 
         from each group of overlapping boxes.
         
         Args:
@@ -192,32 +248,48 @@ class RoadPanelDetector:
         if len(detections) == 0:
             return []
 
-        # Sort by area (largest first)
-        # This way we prioritize larger detections
+        # Order by score and size (score*size^0.2)
         detections = sorted(
-            detections,
-            key=lambda d: (
-                (d[2] - d[0]) *  # width
-                (d[3] - d[1])    # height
-            ),
-            reverse=True
-        )
+            detections, 
+            key=lambda d: d[4] * ( (d[2]-d[0]) * (d[3]-d[1]) )**0.2, 
+            reverse=True)
 
         final = []
 
+        # Greedy selection of the best one
         for det in detections:
-            overlaps = False
 
-            for kept in final:
-                # Compute IoU (Intersection over Union)
-                iou = self.compute_iou(det, kept)
+            x1, y1, x2, y2, s1 = det
+            area1 = (x2 - x1) * (y2 - y1)
 
-                if iou > 0.0:
-                    overlaps = True
+            keep = True
+
+            for f in final:
+                fx1, fy1, fx2, fy2, s2 = f
+
+                # 1. IoU
+                iou = self.compute_iou(det, f)
+
+                # 2. Containment
+                inter_x1 = max(x1, fx1)
+                inter_y1 = max(y1, fy1)
+                inter_x2 = min(x2, fx2)
+                inter_y2 = min(y2, fy2)
+
+                inter_w = max(0, inter_x2 - inter_x1)
+                inter_h = max(0, inter_y2 - inter_y1)
+                inter_area = inter_w * inter_h
+
+                area_small = min(area1, (fx2 - fx1) * (fy2 - fy1))
+
+                containment = inter_area / (area_small + 1e-6)
+
+                # Decision
+                if iou > 0.15 or containment > 0.7:
+                    keep = False
                     break
 
-            # Keep this detection if it doesn't overlap much with others
-            if not overlaps:
+            if keep:
                 final.append(det)
 
         return final
@@ -247,15 +319,8 @@ class RoadPanelDetector:
         interArea = interW * interH
 
         # Compute area of each box
-        areaA = (
-            (boxA[2] - boxA[0]) *
-            (boxA[3] - boxA[1])
-        )
-
-        areaB = (
-            (boxB[2] - boxB[0]) *
-            (boxB[3] - boxB[1])
-        )
+        areaA = ((boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+        areaB = ((boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
 
         # Compute union area
         union = areaA + areaB - interArea
@@ -263,15 +328,13 @@ class RoadPanelDetector:
         # Return IoU
         return interArea / (union + 1e-6)
 
-    def _preprocess_image(self, image):
+    def preprocess_image(self, image):
         """
         Preprocess image to improve detection quality.
         
         Steps:
-        1. Detail enhancement to reduce fog/haze effects
-        2. Bilateral filter to smooth while preserving edges
-        3. Gamma correction to handle backlight
-        4. White balance to normalize colors
+        1. Gamma correction to handle backlight
+        2. White balance to normalize colors
         
         Args:
             image: Input image (BGR)
@@ -280,22 +343,16 @@ class RoadPanelDetector:
             Preprocessed image
         """
         
-        # Step 1: Detail enhancement (reduces fog/haze)
-        image = cv2.detailEnhance(image, sigma_s=10, sigma_r=0.15)
-        
-        # Step 2: Bilateral filter (smooths while preserving edges)
-        image = cv2.bilateralFilter(image, 9, 75, 75)
-        
-        # Step 3: Gamma correction (handles lighting variations)
-        gamma = self._estimate_gamma(image)
+        # Step 1: Gamma correction (handles lighting variations)
+        gamma = self.estimate_gamma(image)
         image = np.uint8(255 * np.power(image / 255.0, gamma))
         
-        # Step 4: White balance (normalizes colors)
-        image = self._white_balance(image)
+        # Step 2: White balance (normalizes colors)
+        image = self.white_balance(image)
         
         return image
 
-    def _white_balance(self, image):
+    def white_balance(self, image):
         """
         Apply automatic white balance using channel stretching.
         
@@ -324,7 +381,7 @@ class RoadPanelDetector:
         
         return result.astype(np.uint8)
 
-    def _estimate_gamma(self, image):
+    def estimate_gamma(self, image):
         """
         Estimate gamma correction value based on image brightness.
         
