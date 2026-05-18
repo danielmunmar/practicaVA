@@ -69,7 +69,7 @@ class RoadPanelDetector:
             aspect_ratio = w / float(h)
 
             # Adjusted range based on real panel proportions
-            if aspect_ratio < 0.8 or aspect_ratio > 6.5:
+            if aspect_ratio < 0.8:
                 continue
 
             # Expand bounding box to include white border
