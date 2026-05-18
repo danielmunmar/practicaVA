@@ -345,7 +345,7 @@ class RoadPanelDetector:
         
         # Step 1: Gamma correction (handles lighting variations)
         gamma = self.estimate_gamma(image)
-        image = np.uint8(255 * np.power(image / 255.0, gamma))
+        image = self._adjust_gamma(image, gamma)
         
         # Step 2: White balance (normalizes colors)
         image = self.white_balance(image)
@@ -385,9 +385,13 @@ class RoadPanelDetector:
         """
         Estimate gamma correction value based on image brightness.
         
-        Gamma < 1.0: brightens image (good for dark/backlit images)
+        Gamma > 1.0: brightens image (good for dark/backlit images)
         Gamma = 1.0: no change
-        Gamma > 1.0: darkens image (good for overexposed images)
+        Gamma < 1.0: darkens image (good for overexposed images)
+
+	    It is adapted for LUT gamma correction using:
+
+            output = input^(1/gamma)
         
         Args:
             image: Input image (BGR)
@@ -398,21 +402,33 @@ class RoadPanelDetector:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         mean_brightness = np.mean(gray)
 
-        # Adaptive gamma based on brightness
         if mean_brightness < 80:
             # Very dark image - brighten significantly
-            gamma = 0.6
+            gamma = 1.0 / 0.6   # ≈ 1.67
+
         elif mean_brightness < 120:
             # Dark image - brighten
-            gamma = 0.75
+            gamma = 1.0 / 0.75  # ≈ 1.33
+
         elif mean_brightness > 200:
             # Very bright image - darken significantly
-            gamma = 0.4
+            gamma = 1.0 / 0.4   # = 2.5
+
         elif mean_brightness > 180:
             # Bright image - darken
-            gamma = 0.55
+            gamma = 1.0 / 0.55  # ≈ 1.82
+
         else:
-            # Normal brightness - no change
             gamma = 1.0
-        
+
         return gamma
+
+    def _adjust_gamma(self, image, gamma=1.0):
+        invGamma = 1.0 / gamma
+
+        table = np.array([
+            ((i / 255.0) ** invGamma) * 255
+            for i in np.arange(0, 256)
+        ]).astype("uint8")
+
+        return cv2.LUT(image, table)
