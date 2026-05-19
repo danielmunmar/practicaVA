@@ -2,8 +2,7 @@ import os
 import cv2
 import numpy as np
 import argparse
-from matplotlib import pyplot as plt
-from detector import RoadPanelDetector
+import importlib
 
 class PanelDetectionPipeline:
     def __init__(self, train_path=None, test_path=None, detector_name=""):
@@ -144,10 +143,20 @@ class PanelDetectionPipeline:
             print("=" * 70 + "\n")
 
     def create_detector(self):
-            """Creates and initializes the detector."""
-            print("Initializing detector...")
-            self.detector = RoadPanelDetector()
+        """Creates and initializes the detector."""
+        
+        print(f"Initializing detector: {self.detector_name}")
+
+        try:
+            module = importlib.import_module(self.detector_name)
+            detector_class = getattr(module, "RoadPanelDetector")
+            self.detector = detector_class()
+
             print("Detector ready\n")
+
+        except Exception as e:
+            print(f"ERROR loading detector '{self.detector_name}': {e}")
+            exit(1)
         
     def setup_output_directories(self):
             """Creates necessary output directories."""
